@@ -1,0 +1,40 @@
+{
+  "name": "slothlabs-contracts",
+  "version": "1.0.0",
+  "description": "SlothLabs Smart Contracts - Crowdfunding and NFT",
+  "scripts": {
+    "compile": "hardhat compile",
+    "test": "hardhat test",
+    "test:coverage": "hardhat coverage",
+    "node": "hardhat node",
+    "clean": "hardhat clean",
+    "deploy:local": "hardhat run scripts/deploy.js --network localhost",
+    "deploy:avalanche": "hardhat run scripts/deploy-avalanche.js --network avalanche",
+    "deploy:avalanche:testnet": "hardhat run scripts/deploy-avalanche.js --network avalancheFuji",
+    "deploy:base": "hardhat run scripts/deploy-base.js --network base",
+    "deploy:base:testnet": "hardhat run scripts/deploy-base.js --network baseSepolia",
+    "verify:avalanche": "hardhat verify --network avalanche",
+    "verify:base": "hardhat verify --network base"
+  },
+  "devDependencies": {
+    "@nomicfoundation/hardhat-chai-matchers": "^2.0.0",
+    "@nomicfoundation/hardhat-ethers": "^3.0.0",
+    "@nomicfoundation/hardhat-network-helpers": "^1.0.0",
+    "@nomicfoundation/hardhat-toolbox": "^4.0.0",
+    "@typechain/ethers-v6": "^0.5.0",
+    "@typechain/hardhat": "^9.0.0",
+    "chai": "^4.3.7",
+    "dotenv": "^16.6.1",
+    "ethers": "^6.9.0",
+    "hardhat": "^2.19.0",
+    "hardhat-gas-reporter": "^1.0.9",
+    "solidity-coverage": "^0.8.5",
+    "typechain": "^8.3.0"
+  },
+  "dependencies": {
+    "@chainlink/contracts": "^0.8.0",
+    "@layerzerolabs/solidity-examples": "^1.1.0",
+    "@openzeppelin/contracts": "^4.9.3",
+    "@uniswap/v3-core": "^1.0.1"
+  }
+}

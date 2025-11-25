@@ -1,0 +1,46 @@
+# Dependencies
+node_modules/
+
+# Proprietary - keep local, don't share publicly
+config/
+scripts/
+docs/
+ARCHITECTURE.md
+ECOSYSTEM_VISUAL.md
+
+# Build artifacts
+artifacts/
+cache/
+typechain/
+typechain-types/
+
+# Environment variables (NEVER commit secrets!)
+.env
+.env.local
+.env.*.local
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Coverage
+coverage/
+coverage.json
+
+# Gas reports
+gas-report.txt
+
+# Logs
+*.log
+npm-debug.log*
+
+# Temporary files
+*.tmp
+*.temp
