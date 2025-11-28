@@ -4,6 +4,7 @@ pragma solidity ^0.8.20;
 import "../interfaces/IERC20.sol";
 import "../interfaces/IPriceOracle.sol";
 import "../interfaces/ISlothPriceOracle.sol";
+import "../interfaces/IDreamsStaking.sol";
 import "../libraries/SafeMath.sol";
 import "../libraries/SafeERC20.sol";
 import "../libraries/ReentrancyGuard.sol";
@@ -21,17 +22,28 @@ import "../libraries/ReentrancyGuard.sol";
  * 5. If approved, creator gets paid. If rejected, backers can get refunds.
  *
  * MONEY SPLIT WHEN MILESTONES PASS:
- * - 80% goes to the creator
- * - 10% goes to the platform treasury
- * - 5% goes to JUICY token stakers
- * - 5% goes to DREAMS token stakers
+ * - 92.5% goes to the creator
+ * - 5% goes to the platform treasury
+ * - 1.25% goes to JUICY token stakers
+ * - 1.25% goes to DREAMS token stakers
  *
  * SAFETY FEATURES:
  * - All money is held in this contract until milestones are approved
- * - Creators must put down a 10% deposit (skin in the game)
+ * - Creators put down a dynamic deposit (skin in the game):
+ *   • 10% for goals under $50K
+ *   • 8% for goals $50K - $100K
+ *   • 5% for goals over $100K
  * - 24-hour waiting period before you can vote (prevents cheating with borrowed money)
  * - Backers have 1 year to claim refunds if a project fails
- * - Dispute system with neutral arbitrator if there's disagreement
+ * - Decentralized dispute resolution via DREAMS staker community voting
+ *
+ * DISPUTE RESOLUTION (DECENTRALIZED):
+ * - If a milestone is rejected, creator can open a dispute within 7 days
+ * - DREAMS stakers vote using hybrid quadratic + time-weighted voting
+ * - Voting power = sqrt(staked_tokens) × time_multiplier (rewards loyalty over wealth)
+ * - Time multipliers: 0-30 days = 1x, 30-90 days = 1.25x, 90-180 days = 1.5x, 180+ days = 2x
+ * - Results: >66% for creator = 100% release, >66% for backers = 0%, otherwise = 50/50 split
+ * - Minimum 5 voters and 10% quorum required
  *
  * TECHNICAL NOTES (for developers):
  * - Uses compact storage to save on blockchain fees
@@ -114,19 +126,26 @@ contract MilestoneCrowdfunding is ReentrancyGuard {
 
     enum DisputeStatus {
         NONE,
-        PENDING,
+        VOTING,                       // Community voting in progress
         RESOLVED_FOR_CREATOR,
-        RESOLVED_FOR_BACKERS
+        RESOLVED_FOR_BACKERS,
+        RESOLVED_SPLIT               // 50/50 split decision
     }
 
     struct Dispute {
         uint256 campaignId;
         uint256 milestoneIndex;
         bytes32 evidenceHash;         // IPFS hash of creator's evidence
-        uint256 deadline;             // 7 days from initiation
+        uint256 votingEndTime;        // When community voting ends
         DisputeStatus status;
         uint256 releasePercentage;    // 0, 5000, or 10000 (0%, 50%, 100%)
+        uint256 votesForCreator;      // Hybrid voting power supporting creator
+        uint256 votesForBackers;      // Hybrid voting power supporting backers
+        uint256 totalVoters;          // Number of unique voters
     }
+
+    // Track who has voted on each dispute (one vote per staker per dispute)
+    mapping(uint256 => mapping(address => bool)) public disputeVotes;
 
     // ============ STATE VARIABLES ============
 
@@ -138,10 +157,10 @@ contract MilestoneCrowdfunding is ReentrancyGuard {
     // Format: milestoneVotes[campaignId][milestoneIndex][voterAddress] = true/false
     mapping(uint256 => mapping(uint256 => mapping(address => bool))) public milestoneVotes;
 
-    // Dispute resolution
+    // Dispute resolution (decentralized community voting)
     mapping(uint256 => Dispute) public disputes;
-    address public arbitrator;
     uint256 public disputeCount;
+    IDreamsStaking public dreamsStakingContract;  // For hybrid voting power calculation
 
     // Campaign failure timestamps (for refund expiration)
     mapping(uint256 => uint256) public campaignFailedTimestamp;
@@ -164,16 +183,21 @@ contract MilestoneCrowdfunding is ReentrancyGuard {
 
     // HOW THE MONEY IS SPLIT when a milestone is approved:
     // Example: If $10,000 is released for a milestone...
-    uint256 public constant CREATOR_SHARE_BPS = 8000;       // 80% ($8,000) goes to the creator
-    uint256 public constant PLATFORM_FEE_BPS = 1000;        // 10% ($1,000) goes to platform treasury
-    uint256 public constant JUICY_STAKER_BPS = 500;         // 5% ($500) goes to JUICY stakers
-    uint256 public constant DREAMS_STAKER_BPS = 500;        // 5% ($500) goes to DREAMS stakers
+    uint256 public constant CREATOR_SHARE_BPS = 9250;       // 92.5% ($9,250) goes to the creator
+    uint256 public constant PLATFORM_FEE_BPS = 500;         // 5% ($500) goes to platform treasury
+    uint256 public constant JUICY_STAKER_BPS = 125;         // 1.25% ($125) goes to JUICY stakers
+    uint256 public constant DREAMS_STAKER_BPS = 125;        // 1.25% ($125) goes to DREAMS stakers
     // CAMPAIGN RULES:
     uint256 public constant MIN_CAMPAIGN_DURATION = 7 days;   // Campaigns must run at least 7 days
     uint256 public constant MAX_CAMPAIGN_DURATION = 90 days;  // Campaigns can run up to 90 days
     uint256 public constant VOTING_PERIOD = 7 days;           // Backers get 7 days to vote on milestones
     uint256 public constant MIN_VOTE_QUORUM_BPS = 5000;       // At least 50% of backers must vote
-    uint256 public constant CREATOR_DEPOSIT_BPS = 1000;       // Creator must deposit 10% of goal (refunded on success)
+    // Dynamic creator deposit - scales down for larger campaigns (incentivizes bigger projects)
+    uint256 public constant CREATOR_DEPOSIT_BPS_SMALL = 1000;  // 10% for goals < $50K
+    uint256 public constant CREATOR_DEPOSIT_BPS_MEDIUM = 800;  // 8% for goals $50K - $100K
+    uint256 public constant CREATOR_DEPOSIT_BPS_LARGE = 500;   // 5% for goals > $100K
+    uint256 public constant DEPOSIT_TIER_MEDIUM = 50000 * 1e18;  // $50,000 threshold
+    uint256 public constant DEPOSIT_TIER_LARGE = 100000 * 1e18;  // $100,000 threshold
     uint256 public constant DREAMS_BONUS_BPS = 1000;          // 10% bonus if you contribute with DREAMS tokens
     uint256 public constant MIN_MILESTONES = 3;               // Projects need at least 3 milestones
     uint256 public constant MAX_MILESTONES = 10;              // Projects can have up to 10 milestones
@@ -182,7 +206,10 @@ contract MilestoneCrowdfunding is ReentrancyGuard {
     uint256 public constant PRECISION = 1e18;                 // Math precision (internal use)
     uint256 public constant REFUND_FEE_BPS = 300;             // 3% fee on refunds (covers processing costs)
     uint256 public constant REFUND_CLAIM_PERIOD = 365 days;   // You have 1 year to claim your refund
-    uint256 public constant DISPUTE_PERIOD = 7 days;          // Creator has 7 days to dispute a rejection
+    uint256 public constant DISPUTE_PERIOD = 7 days;          // Creator has 7 days to initiate a dispute
+    uint256 public constant DISPUTE_VOTING_PERIOD = 5 days;   // Community has 5 days to vote on disputes
+    uint256 public constant DISPUTE_MIN_VOTERS = 5;           // Minimum voters required for valid dispute resolution
+    uint256 public constant DISPUTE_QUORUM_BPS = 1000;        // 10% of total staking power must vote
 
     // Creator reputation
     mapping(address => uint256) public creatorSuccessfulCampaigns;
@@ -254,21 +281,30 @@ contract MilestoneCrowdfunding is ReentrancyGuard {
     // Campaign cancellation
     event CampaignCancelled(uint256 indexed campaignId, bytes32 reasonHash);
 
-    // Dispute events
+    // Dispute events (decentralized community voting)
     event DisputeInitiated(
         uint256 indexed disputeId,
         uint256 indexed campaignId,
         uint256 milestoneIndex,
         bytes32 evidenceHash,
-        uint256 deadline
+        uint256 votingEndTime
+    );
+    event DisputeVoteCast(
+        uint256 indexed disputeId,
+        address indexed voter,
+        bool supportCreator,
+        uint256 votingPower
     );
     event DisputeResolved(
         uint256 indexed disputeId,
-        bool inFavorOfCreator,
-        uint256 releasePercentage
+        DisputeStatus result,
+        uint256 releasePercentage,
+        uint256 votesForCreator,
+        uint256 votesForBackers,
+        uint256 totalVoters
     );
-    event ArbitratorUpdated(address indexed oldArbitrator, address indexed newArbitrator);
     event StakingPoolUpdated(string poolType, address indexed poolAddress);
+    event DreamsStakingContractUpdated(address indexed oldContract, address indexed newContract);
 
     // Refund expiration
     event ExpiredRefundsSwept(uint256 indexed campaignId, uint256 amount);
@@ -312,7 +348,6 @@ contract MilestoneCrowdfunding is ReentrancyGuard {
     error AlreadyRefunded();
     error NoPendingAdmin();
     error CampaignNotCancellable();
-    error OnlyArbitrator();
     error DisputeNotFound();
     error DisputeAlreadyExists();
     error DisputePeriodExpired();
@@ -321,29 +356,30 @@ contract MilestoneCrowdfunding is ReentrancyGuard {
     error RefundPeriodExpired();
     error NoExpiredRefunds();
     error InvalidReleasePercentage();
+    error DisputeVotingNotActive();
+    error AlreadyVotedOnDispute();
+    error NotAStaker();
+    error DisputeVotingNotEnded();
+    error QuorumNotReached();
+    error StakingContractNotSet();
 
     // ============ INTERNAL STRUCTS ============
 
     /**
-     * @dev Container for the 80/10/5/5 money split calculation.
+     * @dev Container for the 92.5/5/1.25/1.25 money split calculation.
      * When a milestone is approved, the funds are divided like this:
      */
     struct FeeSplit {
-        uint256 creatorAmount;      // 80% - The project creator gets the majority
-        uint256 treasuryAmount;     // 10% - Platform fee for operating costs
-        uint256 juicyStakerAmount;  // 5% - Reward for people staking JUICY tokens
-        uint256 dreamsStakerAmount; // 5% - Reward for people staking DREAMS tokens
+        uint256 creatorAmount;      // 92.5% - The project creator gets the majority
+        uint256 treasuryAmount;     // 5% - Platform fee for operating costs
+        uint256 juicyStakerAmount;  // 1.25% - Reward for people staking JUICY tokens
+        uint256 dreamsStakerAmount; // 1.25% - Reward for people staking DREAMS tokens
     }
 
     // ============ MODIFIERS ============
 
     modifier onlyAdmin() {
         if (msg.sender != admin) revert OnlyAdmin();
-        _;
-    }
-
-    modifier onlyArbitrator() {
-        if (msg.sender != arbitrator) revert OnlyArbitrator();
         _;
     }
 
@@ -448,8 +484,10 @@ contract MilestoneCrowdfunding is ReentrancyGuard {
         // Check creator reputation limits
         _checkCreatorLimits(msg.sender, _goalAmount);
 
-        // Calculate required deposit (10% of goal)
-        uint256 depositRequired = _goalAmount.percentage(CREATOR_DEPOSIT_BPS);
+        // Calculate required deposit using dynamic rate based on goal size
+        // Larger campaigns get lower rates: 10% (<$50K), 8% ($50K-$100K), 5% (>$100K)
+        uint256 depositBps = _getCreatorDepositBps(_goalAmount);
+        uint256 depositRequired = _goalAmount.percentage(depositBps);
 
         // Transfer creator deposit using SafeERC20
         IERC20(USDC_ADDRESS).safeTransferFrom(msg.sender, address(this), depositRequired);
@@ -506,6 +544,25 @@ contract MilestoneCrowdfunding is ReentrancyGuard {
         if (_successCount == 1) return 50000 * 1e18;
         if (_successCount == 2) return 100000 * 1e18;
         return 500000 * 1e18;
+    }
+
+    /**
+     * @dev Calculate dynamic creator deposit rate based on goal amount
+     * Larger campaigns get lower deposit rates to incentivize bigger projects:
+     * - Goals < $50K: 10% deposit
+     * - Goals $50K - $100K: 8% deposit
+     * - Goals > $100K: 5% deposit
+     * @param _goalAmount Campaign goal in USD (18 decimals)
+     * @return depositBps The deposit rate in basis points
+     */
+    function _getCreatorDepositBps(uint256 _goalAmount) internal pure returns (uint256) {
+        if (_goalAmount >= DEPOSIT_TIER_LARGE) {
+            return CREATOR_DEPOSIT_BPS_LARGE;  // 5% for $100K+
+        } else if (_goalAmount >= DEPOSIT_TIER_MEDIUM) {
+            return CREATOR_DEPOSIT_BPS_MEDIUM; // 8% for $50K-$100K
+        } else {
+            return CREATOR_DEPOSIT_BPS_SMALL;  // 10% for <$50K
+        }
     }
 
     // ============ CONTRIBUTIONS ============
@@ -830,15 +887,15 @@ contract MilestoneCrowdfunding is ReentrancyGuard {
     // ============ FEE DISTRIBUTION HELPERS ============
 
     /**
-     * @notice Calculate the 80/10/5/5 fee split for a given amount
+     * @notice Calculate the 92.5/5/1.25/1.25 fee split for a given amount
      * @dev Ensures precision by calculating dreamsStaker as remainder
      * @param _totalAmount The total amount to split
      * @return split The calculated fee split amounts
      */
     function _calculateFeeSplit(uint256 _totalAmount) internal pure returns (FeeSplit memory split) {
-        split.creatorAmount = (_totalAmount * CREATOR_SHARE_BPS) / 10000;      // 80%
-        split.treasuryAmount = (_totalAmount * PLATFORM_FEE_BPS) / 10000;       // 10%
-        split.juicyStakerAmount = (_totalAmount * JUICY_STAKER_BPS) / 10000;    // 5%
+        split.creatorAmount = (_totalAmount * CREATOR_SHARE_BPS) / 10000;      // 92.5%
+        split.treasuryAmount = (_totalAmount * PLATFORM_FEE_BPS) / 10000;       // 5%
+        split.juicyStakerAmount = (_totalAmount * JUICY_STAKER_BPS) / 10000;    // 1.25%
         // Use remainder for last portion to ensure precision
         split.dreamsStakerAmount = _totalAmount - split.creatorAmount - split.treasuryAmount - split.juicyStakerAmount;
     }
@@ -953,11 +1010,11 @@ contract MilestoneCrowdfunding is ReentrancyGuard {
         emit CampaignCancelled(_campaignId, _reasonHash);
     }
 
-    // ============ DISPUTE RESOLUTION ============
+    // ============ DISPUTE RESOLUTION (DECENTRALIZED COMMUNITY VOTING) ============
 
     /**
-     * @notice Creator initiates dispute for rejected milestone
-     * @dev Must be called within 7 days of rejection
+     * @notice Creator initiates dispute for rejected milestone - triggers community voting
+     * @dev Must be called within 7 days of rejection. Opens 5-day voting period for DREAMS stakers.
      * @param _campaignId Campaign with rejected milestone
      * @param _evidenceHash IPFS hash of additional evidence
      */
@@ -967,6 +1024,8 @@ contract MilestoneCrowdfunding is ReentrancyGuard {
         onlyCreator(_campaignId)
         returns (uint256)
     {
+        if (address(dreamsStakingContract) == address(0)) revert StakingContractNotSet();
+
         Campaign storage campaign = campaigns[_campaignId];
         uint256 milestoneIndex = campaign.currentMilestoneIndex;
         Milestone storage milestone = milestones[_campaignId][milestoneIndex];
@@ -980,55 +1039,202 @@ contract MilestoneCrowdfunding is ReentrancyGuard {
             revert DisputePeriodExpired();
         }
 
-        // Check no existing dispute
-        if (disputes[_campaignId].status == DisputeStatus.PENDING) revert DisputeAlreadyExists();
+        // Check no existing dispute in voting
+        if (disputes[_campaignId].status == DisputeStatus.VOTING) revert DisputeAlreadyExists();
 
         uint256 disputeId = disputeCount++;
         Dispute storage dispute = disputes[_campaignId];
         dispute.campaignId = _campaignId;
         dispute.milestoneIndex = milestoneIndex;
         dispute.evidenceHash = _evidenceHash;
-        dispute.deadline = block.timestamp + DISPUTE_PERIOD;
-        dispute.status = DisputeStatus.PENDING;
+        dispute.votingEndTime = block.timestamp + DISPUTE_VOTING_PERIOD;
+        dispute.status = DisputeStatus.VOTING;
+        dispute.votesForCreator = 0;
+        dispute.votesForBackers = 0;
+        dispute.totalVoters = 0;
 
-        emit DisputeInitiated(disputeId, _campaignId, milestoneIndex, _evidenceHash, dispute.deadline);
+        emit DisputeInitiated(disputeId, _campaignId, milestoneIndex, _evidenceHash, dispute.votingEndTime);
 
         return disputeId;
     }
 
     /**
-     * @notice Arbitrator resolves a dispute
-     * @dev Can release 0%, 50%, or 100% of milestone funds
-     * @param _campaignId Campaign with dispute
-     * @param _inFavorOfCreator True to rule in favor of creator
-     * @param _releasePercentageBps Percentage to release (0, 5000, or 10000)
+     * @notice DREAMS stakers vote on a dispute using hybrid quadratic + time-weighted voting
+     * @dev Voting power = sqrt(staked_tokens) × time_multiplier
+     *      Time multipliers: 0-30 days = 1.0x, 30-90 days = 1.25x, 90-180 days = 1.5x, 180+ days = 2.0x
+     * @param _campaignId Campaign with active dispute
+     * @param _supportCreator True to support creator, false to support backers
      */
-    function resolveDispute(
-        uint256 _campaignId,
-        bool _inFavorOfCreator,
-        uint256 _releasePercentageBps
-    )
+    function voteOnDispute(uint256 _campaignId, bool _supportCreator)
         external
-        onlyArbitrator
         campaignExists(_campaignId)
     {
         Dispute storage dispute = disputes[_campaignId];
-        if (dispute.status != DisputeStatus.PENDING) revert DisputeNotFound();
+        if (dispute.status != DisputeStatus.VOTING) revert DisputeVotingNotActive();
+        if (block.timestamp >= dispute.votingEndTime) revert VotingPeriodEnded();
+        if (disputeVotes[_campaignId][msg.sender]) revert AlreadyVotedOnDispute();
 
-        // Validate release percentage (0%, 50%, or 100% only)
-        if (_releasePercentageBps != 0 && _releasePercentageBps != 5000 && _releasePercentageBps != 10000) {
-            revert InvalidReleasePercentage();
+        // Get staking info
+        uint256 votingPower = _calculateHybridVotingPower(msg.sender);
+        if (votingPower == 0) revert NotAStaker();
+
+        // Record vote
+        disputeVotes[_campaignId][msg.sender] = true;
+        dispute.totalVoters++;
+
+        if (_supportCreator) {
+            dispute.votesForCreator += votingPower;
+        } else {
+            dispute.votesForBackers += votingPower;
         }
 
-        dispute.status = _inFavorOfCreator ? DisputeStatus.RESOLVED_FOR_CREATOR : DisputeStatus.RESOLVED_FOR_BACKERS;
-        dispute.releasePercentage = _releasePercentageBps;
+        emit DisputeVoteCast(_campaignId, msg.sender, _supportCreator, votingPower);
+    }
 
-        if (_inFavorOfCreator && _releasePercentageBps > 0) {
-            // Release partial or full milestone funds
-            _releaseDisputedFunds(_campaignId, dispute.milestoneIndex, _releasePercentageBps);
+    /**
+     * @notice Calculate hybrid voting power: sqrt(staked) × time_multiplier
+     * @dev Rewards both stake size (quadratic) and loyalty (time-weighted)
+     * @param _voter Address to calculate voting power for
+     * @return votingPower The calculated hybrid voting power (scaled by 1e9 for precision)
+     */
+    function _calculateHybridVotingPower(address _voter) internal view returns (uint256) {
+        (uint256 stakedAmount, uint256 startTime, , , ) = dreamsStakingContract.stakes(_voter);
+
+        if (stakedAmount == 0) return 0;
+
+        // Calculate quadratic component: sqrt(staked)
+        // Using Babylonian method for integer square root
+        uint256 sqrtStaked = _sqrt(stakedAmount);
+
+        // Calculate time multiplier based on stake duration
+        uint256 stakeDuration = block.timestamp - startTime;
+        uint256 timeMultiplier;
+
+        if (stakeDuration >= 180 days) {
+            timeMultiplier = 200; // 2.0x
+        } else if (stakeDuration >= 90 days) {
+            timeMultiplier = 150; // 1.5x
+        } else if (stakeDuration >= 30 days) {
+            timeMultiplier = 125; // 1.25x
+        } else {
+            timeMultiplier = 100; // 1.0x
         }
 
-        emit DisputeResolved(_campaignId, _inFavorOfCreator, _releasePercentageBps);
+        // Voting power = sqrt(staked) × (timeMultiplier / 100)
+        // Scale up for precision
+        return (sqrtStaked * timeMultiplier) / 100;
+    }
+
+    /**
+     * @notice Integer square root using Babylonian method
+     * @param x Number to take square root of
+     * @return y The integer square root
+     */
+    function _sqrt(uint256 x) internal pure returns (uint256 y) {
+        if (x == 0) return 0;
+        uint256 z = (x + 1) / 2;
+        y = x;
+        while (z < y) {
+            y = z;
+            z = (x / z + z) / 2;
+        }
+    }
+
+    /**
+     * @notice Finalize dispute after voting period ends
+     * @dev Anyone can call this after voting period. Requires minimum voters and quorum.
+     *      Result: >66% for creator = 100% release, >66% for backers = 0%, otherwise = 50/50 split
+     * @param _campaignId Campaign with dispute to finalize
+     */
+    function finalizeDispute(uint256 _campaignId)
+        external
+        campaignExists(_campaignId)
+    {
+        Dispute storage dispute = disputes[_campaignId];
+        if (dispute.status != DisputeStatus.VOTING) revert DisputeVotingNotActive();
+        if (block.timestamp < dispute.votingEndTime) revert DisputeVotingNotEnded();
+
+        // Check minimum voters requirement
+        if (dispute.totalVoters < DISPUTE_MIN_VOTERS) revert QuorumNotReached();
+
+        // Check quorum (10% of total staking power must have voted)
+        uint256 totalVotingPower = dispute.votesForCreator + dispute.votesForBackers;
+        uint256 totalStakingPower = dreamsStakingContract.getTotalVotingPower();
+        uint256 requiredQuorum = (totalStakingPower * DISPUTE_QUORUM_BPS) / 10000;
+
+        // Use sqrt of total staking power for quorum to match voting power calculation
+        if (_sqrt(totalVotingPower) < _sqrt(requiredQuorum)) revert QuorumNotReached();
+
+        // Determine outcome based on vote distribution
+        uint256 totalVotes = dispute.votesForCreator + dispute.votesForBackers;
+        uint256 creatorPercentage = (dispute.votesForCreator * 10000) / totalVotes;
+
+        DisputeStatus result;
+        uint256 releasePercentage;
+
+        if (creatorPercentage >= 6666) {
+            // >66.66% support creator = full release
+            result = DisputeStatus.RESOLVED_FOR_CREATOR;
+            releasePercentage = 10000;
+            _releaseDisputedFunds(_campaignId, dispute.milestoneIndex, releasePercentage);
+        } else if (creatorPercentage <= 3333) {
+            // >66.66% support backers = no release
+            result = DisputeStatus.RESOLVED_FOR_BACKERS;
+            releasePercentage = 0;
+        } else {
+            // Close vote = 50/50 split (Solomon's wisdom)
+            result = DisputeStatus.RESOLVED_SPLIT;
+            releasePercentage = 5000;
+            _releaseDisputedFunds(_campaignId, dispute.milestoneIndex, releasePercentage);
+        }
+
+        dispute.status = result;
+        dispute.releasePercentage = releasePercentage;
+
+        emit DisputeResolved(
+            _campaignId,
+            result,
+            releasePercentage,
+            dispute.votesForCreator,
+            dispute.votesForBackers,
+            dispute.totalVoters
+        );
+    }
+
+    /**
+     * @notice Get voting power for an address (view function for UI)
+     * @param _voter Address to check
+     * @return votingPower The calculated hybrid voting power
+     */
+    function getDisputeVotingPower(address _voter) external view returns (uint256) {
+        return _calculateHybridVotingPower(_voter);
+    }
+
+    /**
+     * @notice Get dispute info for UI
+     * @param _campaignId Campaign to check
+     */
+    function getDisputeInfo(uint256 _campaignId)
+        external
+        view
+        returns (
+            DisputeStatus status,
+            uint256 votingEndTime,
+            uint256 votesForCreator,
+            uint256 votesForBackers,
+            uint256 totalVoters,
+            bytes32 evidenceHash
+        )
+    {
+        Dispute storage dispute = disputes[_campaignId];
+        return (
+            dispute.status,
+            dispute.votingEndTime,
+            dispute.votesForCreator,
+            dispute.votesForBackers,
+            dispute.totalVoters,
+            dispute.evidenceHash
+        );
     }
 
     function _releaseDisputedFunds(uint256 _campaignId, uint256 _milestoneIndex, uint256 _percentageBps) internal {
@@ -1041,7 +1247,7 @@ contract MilestoneCrowdfunding is ReentrancyGuard {
 
         campaign.totalReleasedAmount += actualRelease;
 
-        // Distribute funds using helper (handles 80/10/5/5 split)
+        // Distribute funds using helper (handles 92.5/5/1.25/1.25 split)
         _distributeFunds(
             actualRelease,
             campaign.tokenAddress,
@@ -1188,6 +1394,22 @@ contract MilestoneCrowdfunding is ReentrancyGuard {
         return block.timestamp >= contribution.contributionTime + VOTE_LOCK_PERIOD;
     }
 
+    /**
+     * @notice Get the creator deposit rate for a given goal amount
+     * @dev Public function for UI to show deposit requirements before campaign creation
+     * @param _goalAmount Campaign goal in USD (18 decimals)
+     * @return depositBps Deposit rate in basis points (1000 = 10%, 800 = 8%, 500 = 5%)
+     * @return depositAmount The actual deposit amount in USD (18 decimals)
+     */
+    function getCreatorDepositInfo(uint256 _goalAmount)
+        external
+        pure
+        returns (uint256 depositBps, uint256 depositAmount)
+    {
+        depositBps = _getCreatorDepositBps(_goalAmount);
+        depositAmount = (_goalAmount * depositBps) / 10000;
+    }
+
     // ============ ADMIN FUNCTIONS ============
 
     function updateTreasury(address _newTreasury) external onlyAdmin {
@@ -1224,16 +1446,15 @@ contract MilestoneCrowdfunding is ReentrancyGuard {
     }
 
     /**
-     * @notice Set the arbitrator (the neutral judge) for disputes
-     * @dev The arbitrator decides when creators and backers disagree about milestone completion.
-     *      For safety, this should be controlled by multiple people (a multi-sig wallet).
-     * @param _arbitrator New arbitrator address
+     * @notice Set the DreamsStaking contract for hybrid voting power calculation
+     * @dev Required for decentralized dispute resolution. Stakers vote on disputes.
+     * @param _stakingContract Address of the DreamsStaking contract
      */
-    function setArbitrator(address _arbitrator) external onlyAdmin {
-        if (_arbitrator == address(0)) revert InvalidAddress();
-        address oldArbitrator = arbitrator;
-        arbitrator = _arbitrator;
-        emit ArbitratorUpdated(oldArbitrator, _arbitrator);
+    function setDreamsStakingContract(address _stakingContract) external onlyAdmin {
+        if (_stakingContract == address(0)) revert InvalidAddress();
+        address oldContract = address(dreamsStakingContract);
+        dreamsStakingContract = IDreamsStaking(_stakingContract);
+        emit DreamsStakingContractUpdated(oldContract, _stakingContract);
     }
 
     /**

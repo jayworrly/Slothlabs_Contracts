@@ -40,7 +40,7 @@ contract MockAggregatorV3 is AggregatorV3Interface {
         return (roundId, answer, startedAt, updatedAt, answeredInRound);
     }
 
-    function decimals() external view override returns (uint8) {
+    function decimals() external pure override returns (uint8) {
         return DECIMALS;
     }
 }

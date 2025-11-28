@@ -744,4 +744,430 @@ describe("DreamsStaking", function () {
       expect(await staking.getTotalVotingPower()).to.equal(totalVotingPowerBefore + stakeAmount);
     });
   });
+
+  describe("UnstakeForBuyback (Proportional Burn)", function () {
+    let buybackContract;
+    let zDreamsToken;
+
+    beforeEach(async function () {
+      // Get a signer to act as buyback contract
+      const signers = await ethers.getSigners();
+      buybackContract = signers[4];
+
+      // Deploy mock zDREAMS
+      const MockZDreams = await ethers.getContractFactory("MockZDreams");
+      zDreamsToken = await MockZDreams.deploy();
+
+      // Set buyback contract
+      await staking.setBuybackContract(buybackContract.address);
+
+      // Set zDREAMS token
+      await staking.setZDreamsToken(await zDreamsToken.getAddress());
+    });
+
+    it("should only allow buyback contract to call", async function () {
+      const stakeAmount = ethers.parseEther("1000");
+      await staking.connect(user1).stake(stakeAmount);
+
+      // Advance past cliff
+      await time.increase(CLIFF_PERIOD + 1);
+
+      await expect(
+        staking.connect(user1).unstakeForBuyback(user1.address, stakeAmount, user1.address)
+      ).to.be.revertedWithCustomError(staking, "OnlyBuybackContract");
+    });
+
+    it("should reject zero amount", async function () {
+      const stakeAmount = ethers.parseEther("1000");
+      await staking.connect(user1).stake(stakeAmount);
+
+      await expect(
+        staking.connect(buybackContract).unstakeForBuyback(user1.address, 0, user1.address)
+      ).to.be.revertedWithCustomError(staking, "InvalidAmount");
+    });
+
+    it("should reject zero recipient address", async function () {
+      const stakeAmount = ethers.parseEther("1000");
+      await staking.connect(user1).stake(stakeAmount);
+
+      await expect(
+        staking.connect(buybackContract).unstakeForBuyback(user1.address, stakeAmount, ethers.ZeroAddress)
+      ).to.be.revertedWithCustomError(staking, "InvalidAddress");
+    });
+
+    it("should reject if user has insufficient staked balance", async function () {
+      const stakeAmount = ethers.parseEther("1000");
+      await staking.connect(user1).stake(stakeAmount);
+
+      await expect(
+        staking.connect(buybackContract).unstakeForBuyback(user1.address, stakeAmount + 1n, user1.address)
+      ).to.be.revertedWithCustomError(staking, "InsufficientBalance");
+    });
+
+    it("should transfer DREAMS to recipient (buyback contract)", async function () {
+      const stakeAmount = ethers.parseEther("1000");
+      await staking.connect(user1).stake(stakeAmount);
+
+      // Advance past full vesting (no penalty)
+      await time.increase(CLIFF_PERIOD + VESTING_PERIOD + 1);
+
+      const recipientBalanceBefore = await dreamsToken.balanceOf(buybackContract.address);
+
+      await staking.connect(buybackContract).unstakeForBuyback(
+        user1.address,
+        stakeAmount,
+        buybackContract.address
+      );
+
+      const recipientBalanceAfter = await dreamsToken.balanceOf(buybackContract.address);
+      expect(recipientBalanceAfter - recipientBalanceBefore).to.equal(stakeAmount);
+    });
+
+    it("should apply penalty on unvested portion", async function () {
+      const stakeAmount = ethers.parseEther("1000");
+      await staking.connect(user1).stake(stakeAmount);
+
+      // Advance to just past cliff (no vesting yet)
+      await time.increase(CLIFF_PERIOD + 1);
+
+      const treasuryBalanceBefore = await dreamsToken.balanceOf(treasury.address);
+      const recipientBalanceBefore = await dreamsToken.balanceOf(buybackContract.address);
+
+      // At cliff+1 second, almost nothing is vested, so penalty on almost full amount
+      const tx = await staking.connect(buybackContract).unstakeForBuyback(
+        user1.address,
+        stakeAmount,
+        buybackContract.address
+      );
+
+      const treasuryBalanceAfter = await dreamsToken.balanceOf(treasury.address);
+      const recipientBalanceAfter = await dreamsToken.balanceOf(buybackContract.address);
+
+      // Penalty should be 20% of unvested portion
+      const penaltyReceived = treasuryBalanceAfter - treasuryBalanceBefore;
+      const dreamsReceived = recipientBalanceAfter - recipientBalanceBefore;
+
+      expect(penaltyReceived).to.be.gt(0);
+      expect(dreamsReceived + penaltyReceived).to.equal(stakeAmount);
+    });
+
+    it("should apply no penalty on fully vested stake", async function () {
+      const stakeAmount = ethers.parseEther("1000");
+      await staking.connect(user1).stake(stakeAmount);
+
+      // Advance past full vesting
+      await time.increase(CLIFF_PERIOD + VESTING_PERIOD + 1);
+
+      const treasuryBalanceBefore = await dreamsToken.balanceOf(treasury.address);
+
+      await staking.connect(buybackContract).unstakeForBuyback(
+        user1.address,
+        stakeAmount,
+        buybackContract.address
+      );
+
+      const treasuryBalanceAfter = await dreamsToken.balanceOf(treasury.address);
+
+      // No penalty for fully vested stake
+      expect(treasuryBalanceAfter - treasuryBalanceBefore).to.equal(0);
+    });
+
+    it("should burn proportional zDREAMS when user has no bonus", async function () {
+      const stakeAmount = ethers.parseEther("1000");
+
+      // Don't pre-mint zDREAMS - stake() will mint 1:1 for regular staking
+      await zDreamsToken.connect(user1).approve(await staking.getAddress(), ethers.MaxUint256);
+
+      await staking.connect(user1).stake(stakeAmount);
+
+      // Advance past full vesting
+      await time.increase(CLIFF_PERIOD + VESTING_PERIOD + 1);
+
+      const zBalanceBefore = await zDreamsToken.balanceOf(user1.address);
+      // stake() mints 1000 zDREAMS (1:1 ratio for regular stake)
+      expect(zBalanceBefore).to.equal(stakeAmount);
+
+      // Unstake half
+      const unstakeAmount = stakeAmount / 2n;
+      await staking.connect(buybackContract).unstakeForBuyback(
+        user1.address,
+        unstakeAmount,
+        buybackContract.address
+      );
+
+      const zBalanceAfter = await zDreamsToken.balanceOf(user1.address);
+
+      // Should burn proportional amount (50% of zDREAMS since unstaking 50% of stake)
+      // Note: the calculation is zBalance * _amount / (userStake.amount + _amount)
+      // After unstake, userStake.amount is 500, and _amount was 500
+      // So: 1000 * 500 / (500 + 500) = 1000 * 500 / 1000 = 500
+      expect(zBalanceBefore - zBalanceAfter).to.equal(unstakeAmount);
+    });
+
+    it("should burn proportional zDREAMS when user has treasury bonus", async function () {
+      const stakeAmount = ethers.parseEther("1000");
+      const treasuryBonusBps = 1000n; // 10% bonus = 1000 basis points
+      const totalZDreams = stakeAmount + (stakeAmount * treasuryBonusBps) / 10000n; // 1100 zDREAMS
+
+      // Get treasury sale signer
+      const signers = await ethers.getSigners();
+      const treasurySale = signers[5];
+
+      // Set treasury sale contract
+      await staking.setTreasurySaleContract(treasurySale.address);
+
+      // Approve staking contract and mint DREAMS to treasury sale
+      await dreamsToken.mint(treasurySale.address, stakeAmount);
+      await dreamsToken.connect(treasurySale).approve(await staking.getAddress(), ethers.MaxUint256);
+      await zDreamsToken.connect(user1).approve(await staking.getAddress(), ethers.MaxUint256);
+
+      // Stake via treasury (gets 10% bonus zDREAMS)
+      await staking.connect(treasurySale).stakeFor(user1.address, stakeAmount);
+
+      // Advance past full vesting
+      await time.increase(CLIFF_PERIOD + VESTING_PERIOD + 1);
+
+      const zBalanceBefore = await zDreamsToken.balanceOf(user1.address);
+      // stakeFor from treasury mints 1100 zDREAMS (1000 + 10% bonus)
+      expect(zBalanceBefore).to.equal(totalZDreams);
+
+      // Unstake half the DREAMS (500)
+      const unstakeAmount = stakeAmount / 2n;
+      await staking.connect(buybackContract).unstakeForBuyback(
+        user1.address,
+        unstakeAmount,
+        buybackContract.address
+      );
+
+      const zBalanceAfter = await zDreamsToken.balanceOf(user1.address);
+
+      // Proportional burn: zBalance * _amount / (userStake.amount + _amount)
+      // After unstake, userStake.amount = 500
+      // zToBurn = 1100 * 500 / (500 + 500) = 1100 * 500 / 1000 = 550
+      // This means user loses bonus proportionally
+      const expectedBurn = (totalZDreams * unstakeAmount) / stakeAmount;
+      expect(zBalanceBefore - zBalanceAfter).to.equal(expectedBurn);
+    });
+
+    it("should handle multiple partial unstakes correctly", async function () {
+      const stakeAmount = ethers.parseEther("1000");
+
+      // Don't pre-mint - stake() will mint zDREAMS 1:1
+      await zDreamsToken.connect(user1).approve(await staking.getAddress(), ethers.MaxUint256);
+
+      await staking.connect(user1).stake(stakeAmount);
+
+      // Advance past full vesting
+      await time.increase(CLIFF_PERIOD + VESTING_PERIOD + 1);
+
+      // First partial unstake (25%)
+      const firstUnstake = ethers.parseEther("250");
+      await staking.connect(buybackContract).unstakeForBuyback(
+        user1.address,
+        firstUnstake,
+        buybackContract.address
+      );
+
+      let stakeInfo = await staking.stakes(user1.address);
+      expect(stakeInfo.amount).to.equal(ethers.parseEther("750"));
+
+      // Second partial unstake (25% of original = 250)
+      const secondUnstake = ethers.parseEther("250");
+      await staking.connect(buybackContract).unstakeForBuyback(
+        user1.address,
+        secondUnstake,
+        buybackContract.address
+      );
+
+      stakeInfo = await staking.stakes(user1.address);
+      expect(stakeInfo.amount).to.equal(ethers.parseEther("500"));
+
+      // Third partial unstake (remaining 500)
+      const thirdUnstake = ethers.parseEther("500");
+      await staking.connect(buybackContract).unstakeForBuyback(
+        user1.address,
+        thirdUnstake,
+        buybackContract.address
+      );
+
+      stakeInfo = await staking.stakes(user1.address);
+      expect(stakeInfo.amount).to.equal(0);
+
+      // Verify start time is reset when fully unstaked
+      expect(stakeInfo.startTime).to.equal(0);
+    });
+
+    it("should update totalStaked and totalVotingPower", async function () {
+      const stakeAmount = ethers.parseEther("1000");
+      await staking.connect(user1).stake(stakeAmount);
+
+      // Advance past full vesting
+      await time.increase(CLIFF_PERIOD + VESTING_PERIOD + 1);
+
+      const totalStakedBefore = await staking.totalStaked();
+      const totalVotingPowerBefore = await staking.getTotalVotingPower();
+
+      const unstakeAmount = ethers.parseEther("300");
+      await staking.connect(buybackContract).unstakeForBuyback(
+        user1.address,
+        unstakeAmount,
+        buybackContract.address
+      );
+
+      expect(await staking.totalStaked()).to.equal(totalStakedBefore - unstakeAmount);
+      expect(await staking.getTotalVotingPower()).to.equal(totalVotingPowerBefore - unstakeAmount);
+    });
+
+    it("should emit UnstakedForBuyback event", async function () {
+      const stakeAmount = ethers.parseEther("1000");
+      await staking.connect(user1).stake(stakeAmount);
+
+      // Advance past full vesting (no penalty)
+      await time.increase(CLIFF_PERIOD + VESTING_PERIOD + 1);
+
+      await expect(
+        staking.connect(buybackContract).unstakeForBuyback(
+          user1.address,
+          stakeAmount,
+          buybackContract.address
+        )
+      ).to.emit(staking, "UnstakedForBuyback")
+        .withArgs(user1.address, stakeAmount, stakeAmount, 0, buybackContract.address);
+    });
+
+    it("should handle edge case: unstake exactly vested amount (no penalty)", async function () {
+      const stakeAmount = ethers.parseEther("1000");
+      await staking.connect(user1).stake(stakeAmount);
+
+      // Advance to 50% vested (halfway through vesting period)
+      await time.increase(CLIFF_PERIOD + (VESTING_PERIOD / 2));
+
+      const vestedAmount = await staking.getVestedAmount(user1.address);
+      const treasuryBalanceBefore = await dreamsToken.balanceOf(treasury.address);
+
+      // Unstake exactly the vested amount
+      await staking.connect(buybackContract).unstakeForBuyback(
+        user1.address,
+        vestedAmount,
+        buybackContract.address
+      );
+
+      const treasuryBalanceAfter = await dreamsToken.balanceOf(treasury.address);
+
+      // No penalty since we only unstaked vested amount
+      expect(treasuryBalanceAfter - treasuryBalanceBefore).to.equal(0);
+    });
+
+    it("should handle edge case: zDREAMS balance is less than expected burn", async function () {
+      const stakeAmount = ethers.parseEther("1000");
+
+      // Approve zDREAMS for staking contract (for burn)
+      await zDreamsToken.connect(user1).approve(await staking.getAddress(), ethers.MaxUint256);
+
+      // Stake normally - this mints 1000 zDREAMS
+      await staking.connect(user1).stake(stakeAmount);
+
+      // Simulate user burning some zDREAMS elsewhere (e.g., for cloud boosts)
+      // This creates the edge case: user has 500 zDREAMS but stake expects ~1000 proportional
+      const burnAmount = ethers.parseEther("500");
+      await zDreamsToken.burn(user1.address, burnAmount);
+
+      // Advance past full vesting
+      await time.increase(CLIFF_PERIOD + VESTING_PERIOD + 1);
+
+      const zBalanceBefore = await zDreamsToken.balanceOf(user1.address);
+      expect(zBalanceBefore).to.equal(ethers.parseEther("500")); // 1000 - 500 burned
+
+      // Unstake full amount - contract should cap burn at available balance
+      await staking.connect(buybackContract).unstakeForBuyback(
+        user1.address,
+        stakeAmount,
+        buybackContract.address
+      );
+
+      const zBalanceAfter = await zDreamsToken.balanceOf(user1.address);
+
+      // Should burn at most the available balance
+      expect(zBalanceAfter).to.equal(0);
+      expect(zBalanceBefore - zBalanceAfter).to.equal(ethers.parseEther("500"));
+    });
+
+    it("should handle edge case: user has zero zDREAMS", async function () {
+      const stakeAmount = ethers.parseEther("1000");
+      await staking.connect(user1).stake(stakeAmount);
+
+      // No zDREAMS minted for user
+
+      // Advance past full vesting
+      await time.increase(CLIFF_PERIOD + VESTING_PERIOD + 1);
+
+      // Should succeed without reverting (burns 0)
+      await expect(
+        staking.connect(buybackContract).unstakeForBuyback(
+          user1.address,
+          stakeAmount,
+          buybackContract.address
+        )
+      ).to.not.be.reverted;
+
+      const stakeInfo = await staking.stakes(user1.address);
+      expect(stakeInfo.amount).to.equal(0);
+    });
+
+    it("should work correctly when zDreamsToken is not set", async function () {
+      // Deploy fresh staking contract without zDREAMS
+      const DreamsStaking = await ethers.getContractFactory("DreamsStaking");
+      const freshStaking = await DreamsStaking.deploy(
+        await dreamsToken.getAddress(),
+        await rewardToken.getAddress(),
+        await mockOracle.getAddress(),
+        treasury.address
+      );
+
+      await freshStaking.setBuybackContract(buybackContract.address);
+
+      // Approve and stake
+      await dreamsToken.connect(user1).approve(await freshStaking.getAddress(), ethers.MaxUint256);
+      const stakeAmount = ethers.parseEther("1000");
+      await freshStaking.connect(user1).stake(stakeAmount);
+
+      // Advance past full vesting
+      await time.increase(CLIFF_PERIOD + VESTING_PERIOD + 1);
+
+      // Should work without zDREAMS burning
+      await expect(
+        freshStaking.connect(buybackContract).unstakeForBuyback(
+          user1.address,
+          stakeAmount,
+          buybackContract.address
+        )
+      ).to.not.be.reverted;
+    });
+
+    it("should apply partial penalty for partially vested stake", async function () {
+      const stakeAmount = ethers.parseEther("1000");
+      await staking.connect(user1).stake(stakeAmount);
+
+      // Advance to 50% vested
+      await time.increase(CLIFF_PERIOD + (VESTING_PERIOD / 2));
+
+      const vestedAmount = await staking.getVestedAmount(user1.address);
+      const unvestedAmount = stakeAmount - vestedAmount;
+      const expectedPenalty = (unvestedAmount * BigInt(EARLY_UNSTAKE_PENALTY_BPS)) / 10000n;
+
+      const treasuryBalanceBefore = await dreamsToken.balanceOf(treasury.address);
+
+      await staking.connect(buybackContract).unstakeForBuyback(
+        user1.address,
+        stakeAmount,
+        buybackContract.address
+      );
+
+      const treasuryBalanceAfter = await dreamsToken.balanceOf(treasury.address);
+      const actualPenalty = treasuryBalanceAfter - treasuryBalanceBefore;
+
+      // Allow some tolerance due to block time
+      expect(actualPenalty).to.be.closeTo(expectedPenalty, ethers.parseEther("1"));
+    });
+  });
 });

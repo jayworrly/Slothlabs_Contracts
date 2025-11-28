@@ -112,7 +112,7 @@ contract MockDexRouter {
 
     /**
      * @notice Mock Trader Joe swapExactTokensForTokens
-     * @dev Simulates JUICY → DREAMS swap
+     * @dev Simulates JUICY → DREAMS swap OR DREAMS → JUICY swap
      */
     function swapExactTokensForTokens(
         uint256 amountIn,
@@ -130,12 +130,16 @@ contract MockDexRouter {
         if (path[0] == juicy && path[1] == dreams) {
             // JUICY → DREAMS: 1 JUICY = 7.5 DREAMS
             amounts[1] = (amountIn * JUICY_TO_DREAMS_RATE) / 10;
+            lastDreamsOutput = amounts[1];
+        } else if (path[0] == dreams && path[1] == juicy) {
+            // DREAMS → JUICY: 7.5 DREAMS = 1 JUICY (reverse)
+            amounts[1] = (amountIn * 10) / JUICY_TO_DREAMS_RATE;
+            lastJuicyOutput = amounts[1];
         } else {
             revert("Invalid path");
         }
 
         require(amounts[1] >= amountOutMin, "Insufficient output");
-        lastDreamsOutput = amounts[1];
 
         // Transfer tokens
         IERC20(path[0]).transferFrom(msg.sender, address(this), amountIn);
@@ -145,8 +149,41 @@ contract MockDexRouter {
     }
 
     /**
+     * @notice Mock Trader Joe swapExactTokensForAVAX
+     * @dev Simulates JUICY → AVAX swap (for buyback)
+     */
+    function swapExactTokensForAVAX(
+        uint256 amountIn,
+        uint256 amountOutMin,
+        address[] calldata path,
+        address to,
+        uint256 deadline
+    ) external returns (uint256[] memory amounts) {
+        require(deadline >= block.timestamp, "Expired");
+        require(path.length == 2, "Invalid path");
+        require(path[0] == juicy, "First token must be JUICY");
+        require(path[1] == weth, "Second token must be WAVAX");
+
+        amounts = new uint256[](2);
+        amounts[0] = amountIn;
+        // JUICY → AVAX: 1000 JUICY = 1 AVAX (reverse of NATIVE_TO_JUICY_RATE)
+        amounts[1] = amountIn / NATIVE_TO_JUICY_RATE;
+
+        require(amounts[1] >= amountOutMin, "Insufficient output");
+
+        // Transfer JUICY from sender
+        IERC20(juicy).transferFrom(msg.sender, address(this), amountIn);
+
+        // Send AVAX to recipient
+        (bool success, ) = to.call{value: amounts[1]}("");
+        require(success, "AVAX transfer failed");
+
+        return amounts;
+    }
+
+    /**
      * @notice Mock Trader Joe getAmountsOut
-     * @dev Returns expected output amounts for a swap path
+     * @dev Returns expected output amounts for a swap path (supports both directions)
      */
     function getAmountsOut(uint256 amountIn, address[] calldata path)
         external
@@ -160,9 +197,15 @@ contract MockDexRouter {
             if (path[i] == weth && path[i + 1] == juicy) {
                 // WETH/WAVAX → JUICY
                 amounts[i + 1] = amounts[i] * NATIVE_TO_JUICY_RATE;
+            } else if (path[i] == juicy && path[i + 1] == weth) {
+                // JUICY → WETH/WAVAX (reverse)
+                amounts[i + 1] = amounts[i] / NATIVE_TO_JUICY_RATE;
             } else if (path[i] == juicy && path[i + 1] == dreams) {
                 // JUICY → DREAMS
                 amounts[i + 1] = (amounts[i] * JUICY_TO_DREAMS_RATE) / 10;
+            } else if (path[i] == dreams && path[i + 1] == juicy) {
+                // DREAMS → JUICY (reverse)
+                amounts[i + 1] = (amounts[i] * 10) / JUICY_TO_DREAMS_RATE;
             } else {
                 revert("Unknown pair");
             }

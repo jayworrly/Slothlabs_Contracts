@@ -5,6 +5,7 @@ import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
 import "../interfaces/IPriceOracle.sol";
+import "../interfaces/IzDREAMS.sol";
 
 /**
  * @title DreamsStaking
@@ -40,6 +41,7 @@ contract DreamsStaking is ReentrancyGuard {
     // ============ STATE ============
 
     IERC20 public immutable dreamsToken;
+    IzDREAMS public zDreamsToken;
     IPriceOracle public priceOracle;
 
     address public admin;
@@ -71,6 +73,12 @@ contract DreamsStaking is ReentrancyGuard {
     // Treasury for penalties
     address public treasury;
 
+    // Treasury integration (closed-loop economy)
+    address public treasurySaleContract;   // DreamsTreasurySale contract
+    address public buybackContract;         // DreamsTreasuryBuyback contract
+    uint256 public treasuryBonusBps = 1000; // 10% bonus zDREAMS for treasury purchases
+    uint256 public constant BPS_DENOMINATOR = 10000;
+
     // ============ EVENTS ============
 
     event Staked(address indexed user, uint256 amount, uint256 vestingEnd);
@@ -83,6 +91,11 @@ contract DreamsStaking is ReentrancyGuard {
     event RewardsDeposited(address indexed depositor, uint256 amount);
     event AdminTransferInitiated(address indexed currentAdmin, address indexed pendingAdmin);
     event AdminTransferCompleted(address indexed oldAdmin, address indexed newAdmin);
+    event zDreamsTokenUpdated(address indexed oldToken, address indexed newToken);
+    event TreasurySaleContractUpdated(address indexed oldContract, address indexed newContract);
+    event BuybackContractUpdated(address indexed oldContract, address indexed newContract);
+    event TreasuryBonusUpdated(uint256 oldBonus, uint256 newBonus);
+    event UnstakedForBuyback(address indexed user, uint256 amount, uint256 toRecipient, uint256 penalty, address recipient);
 
     // ============ ERRORS ============
 
@@ -95,11 +108,18 @@ contract DreamsStaking is ReentrancyGuard {
     error CliffNotReached();
     error NoRewardsToClaim();
     error InvalidConfiguration();
+    error OnlyBuybackContract();
+    error BonusTooHigh();
 
     // ============ MODIFIERS ============
 
     modifier onlyAdmin() {
         if (msg.sender != admin) revert OnlyAdmin();
+        _;
+    }
+
+    modifier onlyBuybackContract() {
+        if (msg.sender != buybackContract) revert OnlyBuybackContract();
         _;
     }
 
@@ -136,9 +156,10 @@ contract DreamsStaking is ReentrancyGuard {
      * @dev Internal helper to avoid duplicate code between stake() and stakeFor()
      * @param _beneficiary Address that will own the staked tokens
      * @param _amount Amount of DREAMS to stake
+     * @param _fromTreasury Whether this stake originates from treasury sale (gets bonus zDREAMS)
      * @return vestingEndTime The calculated vesting end time
      */
-    function _processStake(address _beneficiary, uint256 _amount) internal returns (uint256 vestingEndTime) {
+    function _processStake(address _beneficiary, uint256 _amount, bool _fromTreasury) internal returns (uint256 vestingEndTime) {
         StakeInfo storage userStake = stakes[_beneficiary];
 
         // If first time staking or adding to existing stake
@@ -151,6 +172,17 @@ contract DreamsStaking is ReentrancyGuard {
         totalStaked += _amount;
         totalVotingPower += _amount;
 
+        // Mint zDREAMS for voting power and cloud boosts
+        // Treasury purchases get bonus zDREAMS (10% extra voting power incentive)
+        if (address(zDreamsToken) != address(0)) {
+            uint256 zDreamsToMint = _amount;
+            if (_fromTreasury && treasuryBonusBps > 0) {
+                // Example: 1000 DREAMS staked via treasury → 1100 zDREAMS (10% bonus)
+                zDreamsToMint = (_amount * (BPS_DENOMINATOR + treasuryBonusBps)) / BPS_DENOMINATOR;
+            }
+            zDreamsToken.mint(_beneficiary, zDreamsToMint);
+        }
+
         return userStake.startTime + cliffPeriod + vestingPeriod;
     }
 
@@ -161,7 +193,8 @@ contract DreamsStaking is ReentrancyGuard {
     function stake(uint256 _amount) external nonReentrant updateRewards(msg.sender) {
         if (_amount == 0) revert InvalidAmount();
 
-        uint256 vestingEndTime = _processStake(msg.sender, _amount);
+        // Regular stake - no treasury bonus
+        uint256 vestingEndTime = _processStake(msg.sender, _amount, false);
 
         dreamsToken.safeTransferFrom(msg.sender, address(this), _amount);
 
@@ -172,6 +205,7 @@ contract DreamsStaking is ReentrancyGuard {
      * @notice Stake DREAMS tokens on behalf of another user (for auto-lock treasury purchases)
      * @dev Tokens are pulled from msg.sender but staked for _beneficiary
      *      Used by DreamsTreasurySale to auto-stake purchased tokens
+     *      If called by treasurySaleContract, user gets 10% bonus zDREAMS for voting power
      * @param _beneficiary Address that will own the staked tokens
      * @param _amount Amount of DREAMS to stake
      */
@@ -179,7 +213,9 @@ contract DreamsStaking is ReentrancyGuard {
         if (_amount == 0) revert InvalidAmount();
         if (_beneficiary == address(0)) revert InvalidAddress();
 
-        uint256 vestingEndTime = _processStake(_beneficiary, _amount);
+        // Check if this is from treasury sale contract (gets bonus zDREAMS)
+        bool fromTreasury = (msg.sender == treasurySaleContract);
+        uint256 vestingEndTime = _processStake(_beneficiary, _amount, fromTreasury);
 
         // Pull tokens from caller (e.g., treasury sale contract)
         dreamsToken.safeTransferFrom(msg.sender, address(this), _amount);
@@ -213,6 +249,11 @@ contract DreamsStaking is ReentrancyGuard {
         userStake.amount -= _amount;
         totalStaked -= _amount;
         totalVotingPower -= _amount;
+
+        // Burn zDREAMS 1:1 with unstaked amount
+        if (address(zDreamsToken) != address(0)) {
+            zDreamsToken.burn(msg.sender, _amount);
+        }
 
         // Transfer to user
         dreamsToken.safeTransfer(msg.sender, toUser);
@@ -296,7 +337,78 @@ contract DreamsStaking is ReentrancyGuard {
         totalStaked += tokenAmount;
         totalVotingPower += tokenAmount;
 
+        // Mint additional zDREAMS for the compounded amount
+        if (address(zDreamsToken) != address(0)) {
+            zDreamsToken.mint(msg.sender, tokenAmount);
+        }
+
         emit RewardsCompounded(msg.sender, rewardsUSD, tokenAmount, block.timestamp + cliffPeriod + vestingPeriod);
+    }
+
+    /**
+     * @notice Unstake DREAMS for buyback contract (closed-loop economy)
+     * @dev Only callable by the buyback contract. Burns zDREAMS (including any bonus),
+     *      sends DREAMS to recipient (usually treasury), applies vesting penalty.
+     * @param _user User whose position is being unstaked
+     * @param _amount Amount of DREAMS to unstake
+     * @param _recipient Where to send the DREAMS (usually treasury)
+     * @return penalty Amount of DREAMS taken as early withdrawal penalty
+     */
+    function unstakeForBuyback(
+        address _user,
+        uint256 _amount,
+        address _recipient
+    ) external nonReentrant onlyBuybackContract updateRewards(_user) returns (uint256 penalty) {
+        if (_amount == 0) revert InvalidAmount();
+        if (_recipient == address(0)) revert InvalidAddress();
+
+        StakeInfo storage userStake = stakes[_user];
+        if (userStake.amount < _amount) revert InsufficientBalance();
+
+        // Calculate penalty on unvested portion (same logic as regular unstake)
+        uint256 vestedAmount = getVestedAmount(_user);
+        if (_amount > vestedAmount) {
+            uint256 unvestedWithdraw = _amount - vestedAmount;
+            penalty = (unvestedWithdraw * earlyUnstakePenaltyBps) / 10000;
+        }
+
+        uint256 toRecipient = _amount - penalty;
+
+        // Update staking state
+        userStake.amount -= _amount;
+        totalStaked -= _amount;
+        totalVotingPower -= _amount;
+
+        // Burn ALL zDREAMS for this user's unstaked amount
+        // This includes any treasury bonus - when you exit, you lose the bonus voting power
+        if (address(zDreamsToken) != address(0)) {
+            uint256 zBalance = zDreamsToken.balanceOf(_user);
+            // Burn proportional amount of zDREAMS
+            // If user had bonus, they lose the bonus proportionally
+            uint256 zToBurn = _amount;
+            if (userStake.amount + _amount > 0) {
+                // Calculate ratio of zDREAMS to burn based on original stake proportion
+                zToBurn = (zBalance * _amount) / (userStake.amount + _amount);
+            }
+            // Ensure we don't try to burn more than they have
+            if (zToBurn > zBalance) zToBurn = zBalance;
+            zDreamsToken.burn(_user, zToBurn);
+        }
+
+        // Send DREAMS to recipient (buyback contract will forward to treasury)
+        dreamsToken.safeTransfer(_recipient, toRecipient);
+
+        // Send penalty to treasury
+        if (penalty > 0) {
+            dreamsToken.safeTransfer(treasury, penalty);
+        }
+
+        // Reset if fully unstaked
+        if (userStake.amount == 0) {
+            userStake.startTime = 0;
+        }
+
+        emit UnstakedForBuyback(_user, _amount, toRecipient, penalty, _recipient);
     }
 
     // ============ VIEW FUNCTIONS ============
@@ -463,6 +575,48 @@ contract DreamsStaking is ReentrancyGuard {
     function setTreasury(address _treasury) external onlyAdmin {
         if (_treasury == address(0)) revert InvalidAddress();
         treasury = _treasury;
+    }
+
+    /**
+     * @notice Set zDREAMS token contract
+     * @param _zDreamsToken New zDREAMS token address
+     */
+    function setZDreamsToken(address _zDreamsToken) external onlyAdmin {
+        if (_zDreamsToken == address(0)) revert InvalidAddress();
+        address oldToken = address(zDreamsToken);
+        zDreamsToken = IzDREAMS(_zDreamsToken);
+        emit zDreamsTokenUpdated(oldToken, _zDreamsToken);
+    }
+
+    /**
+     * @notice Set treasury sale contract (for bonus zDREAMS)
+     * @param _treasurySaleContract Address of DreamsTreasurySale contract
+     */
+    function setTreasurySaleContract(address _treasurySaleContract) external onlyAdmin {
+        address oldContract = treasurySaleContract;
+        treasurySaleContract = _treasurySaleContract;
+        emit TreasurySaleContractUpdated(oldContract, _treasurySaleContract);
+    }
+
+    /**
+     * @notice Set buyback contract (for closed-loop exits)
+     * @param _buybackContract Address of DreamsTreasuryBuyback contract
+     */
+    function setBuybackContract(address _buybackContract) external onlyAdmin {
+        address oldContract = buybackContract;
+        buybackContract = _buybackContract;
+        emit BuybackContractUpdated(oldContract, _buybackContract);
+    }
+
+    /**
+     * @notice Set treasury bonus for purchases via treasury sale
+     * @param _bonusBps Bonus in basis points (e.g., 1000 = 10% bonus zDREAMS)
+     */
+    function setTreasuryBonus(uint256 _bonusBps) external onlyAdmin {
+        if (_bonusBps > 5000) revert BonusTooHigh(); // Max 50% bonus
+        uint256 oldBonus = treasuryBonusBps;
+        treasuryBonusBps = _bonusBps;
+        emit TreasuryBonusUpdated(oldBonus, _bonusBps);
     }
 
     /**

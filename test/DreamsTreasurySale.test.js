@@ -7,7 +7,7 @@ describe("DreamsTreasurySale", function () {
   let mockRouter;
   let owner, treasury, buyer, admin;
 
-  const TREASURY_FEE_BPS = 1000; // 10%
+  const TREASURY_FEE_BPS = 500; // 5% (updated from 10%)
   const BPS_DENOMINATOR = 10000;
 
   beforeEach(async function () {
@@ -128,7 +128,7 @@ describe("DreamsTreasurySale", function () {
   });
 
   describe("Buy With Native (ETH)", function () {
-    it("should buy DREAMS on market and take 10% fee", async function () {
+    it("should buy DREAMS on market and take 5% fee", async function () {
       const ethAmount = ethers.parseEther("1");
 
       const treasuryDreamsBefore = await dreams.balanceOf(treasury.address);
@@ -150,15 +150,15 @@ describe("DreamsTreasurySale", function () {
       if (!autoStakeEnabled) {
         const buyerGain = buyerDreamsAfter - buyerDreamsBefore;
         expect(buyerGain).to.be.gt(0);
-        // Treasury fee should be ~10% of total (buyer got 90%)
-        // treasuryGain / (treasuryGain + buyerGain) ≈ 10%
+        // Treasury fee should be ~5% of total (buyer got 95%)
+        // treasuryGain / (treasuryGain + buyerGain) ≈ 5%
         const totalDreams = treasuryGain + buyerGain;
         const feePercent = (treasuryGain * 10000n) / totalDreams;
-        expect(feePercent).to.be.closeTo(1000n, 10n); // ~10% with small tolerance
+        expect(feePercent).to.be.closeTo(500n, 10n); // ~5% with small tolerance
       }
     });
 
-    it("should apply correct 10% fee split", async function () {
+    it("should apply correct 5% fee split", async function () {
       // Disable auto-stake for this test
       await treasurySale.toggleAutoStake();
 
@@ -174,11 +174,11 @@ describe("DreamsTreasurySale", function () {
       const treasuryFee = treasuryDreamsAfter - treasuryDreamsBefore;
       const totalDreams = treasuryFee + buyerDreams;
 
-      // Fee should be exactly 10% of total
-      const expectedFee = (totalDreams * 1000n) / 10000n;
+      // Fee should be exactly 5% of total
+      const expectedFee = (totalDreams * 500n) / 10000n;
       expect(treasuryFee).to.equal(expectedFee);
 
-      // User should get exactly 90%
+      // User should get exactly 95%
       const expectedUser = totalDreams - expectedFee;
       expect(buyerDreams).to.equal(expectedUser);
     });
@@ -218,7 +218,7 @@ describe("DreamsTreasurySale", function () {
       await treasurySale.toggleAutoStake();
     });
 
-    it("should buy DREAMS with JUICY and take 10% fee", async function () {
+    it("should buy DREAMS with JUICY and take 5% fee", async function () {
       const juicyAmount = ethers.parseEther("1000");
 
       const treasuryDreamsBefore = await dreams.balanceOf(treasury.address);
@@ -234,18 +234,18 @@ describe("DreamsTreasurySale", function () {
       // Buyer JUICY should have decreased
       expect(buyerJuicyAfter).to.equal(buyerJuicyBefore - juicyAmount);
 
-      // Treasury should have received 10% fee
+      // Treasury should have received 5% fee
       const treasuryFee = treasuryDreamsAfter - treasuryDreamsBefore;
       expect(treasuryFee).to.be.gt(0);
 
-      // Buyer should have received 90%
+      // Buyer should have received 95%
       const buyerGain = buyerDreamsAfter - buyerDreamsBefore;
       expect(buyerGain).to.be.gt(0);
 
-      // Verify 10% fee
+      // Verify 5% fee
       const totalDreams = treasuryFee + buyerGain;
       const feePercent = (treasuryFee * 10000n) / totalDreams;
-      expect(feePercent).to.equal(1000n); // Exactly 10%
+      expect(feePercent).to.equal(500n); // Exactly 5%
     });
 
     it("should revert when sales are disabled", async function () {
@@ -418,9 +418,9 @@ describe("DreamsTreasurySale", function () {
       const [juicyEstimate, dreamsEstimate, treasuryFee, userReceives] =
         await treasurySale.getQuoteNative(nativeAmount);
 
-      // Verify fee calculation
+      // Verify fee calculation (5% fee)
       if (dreamsEstimate > 0) {
-        const expectedFee = (dreamsEstimate * 1000n) / 10000n;
+        const expectedFee = (dreamsEstimate * 500n) / 10000n;
         expect(treasuryFee).to.equal(expectedFee);
         expect(userReceives).to.equal(dreamsEstimate - treasuryFee);
       }
@@ -435,8 +435,8 @@ describe("DreamsTreasurySale", function () {
       // dreamsEstimate from mock: 1000 JUICY * 7.5 = 7500 DREAMS
       expect(dreamsEstimate).to.equal(ethers.parseEther("7500"));
 
-      // 10% fee
-      const expectedFee = (dreamsEstimate * 1000n) / 10000n;
+      // 5% fee
+      const expectedFee = (dreamsEstimate * 500n) / 10000n;
       expect(treasuryFee).to.equal(expectedFee);
       expect(userReceives).to.equal(dreamsEstimate - treasuryFee);
     });
@@ -502,7 +502,7 @@ describe("DreamsTreasurySale (Avalanche Mode)", function () {
     expect(await treasurySale.isAvalanche()).to.equal(true);
   });
 
-  it("should buy DREAMS with AVAX and take 10% fee", async function () {
+  it("should buy DREAMS with AVAX and take 5% fee", async function () {
     const avaxAmount = ethers.parseEther("10");
 
     // Disable auto-stake for testing
@@ -523,10 +523,10 @@ describe("DreamsTreasurySale (Avalanche Mode)", function () {
     expect(treasuryFee).to.be.gt(0);
     expect(buyerGain).to.be.gt(0);
 
-    // Verify 10% fee
+    // Verify 5% fee
     const totalDreams = treasuryFee + buyerGain;
     const feePercent = (treasuryFee * 10000n) / totalDreams;
-    expect(feePercent).to.equal(1000n);
+    expect(feePercent).to.equal(500n);
   });
 
   it("should return quote with Trader Joe style", async function () {

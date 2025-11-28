@@ -8,14 +8,14 @@ import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
 /**
  * @title DreamsTreasurySale
  * @notice When you buy DREAMS tokens, we buy them from the open market for you.
- *         The treasury keeps 10% as a fee, you get 90%.
+ *         The treasury keeps 5% as a fee, you get 95%.
  *
  * HOW IT WORKS:
  * 1. You send ETH (on Base) or AVAX (on Avalanche)
  * 2. We automatically swap it for JUICY tokens
  * 3. We swap JUICY for DREAMS tokens
- * 4. Treasury keeps 10% of the DREAMS (that's how we make money)
- * 5. You receive 90% of the DREAMS
+ * 4. Treasury keeps 5% of the DREAMS (that's how we make money)
+ * 5. You receive 95% of the DREAMS
  *
  * AUTO-STAKE OPTION:
  * If enabled, your DREAMS are automatically staked to start earning rewards
@@ -25,7 +25,8 @@ import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
  * - Creates natural buying pressure for DREAMS tokens (good for price)
  * - Treasury earns sustainable revenue (keeps the platform running)
  * - You get real market prices (not some made-up rate)
- * - Simple and transparent - everyone knows the 10% fee upfront
+ * - Simple and transparent - everyone knows the 5% fee upfront
+ * - Lower fee than competitors encourages adoption
  */
 
 interface ISwapRouter {
@@ -89,7 +90,7 @@ contract DreamsTreasurySale is ReentrancyGuard {
     bool public immutable isAvalanche;
 
     // Fee configuration
-    uint256 public constant TREASURY_FEE_BPS = 1000;  // 10% fee to treasury
+    uint256 public constant TREASURY_FEE_BPS = 500;  // 5% fee to treasury
     uint256 public constant BPS_DENOMINATOR = 10000;
     uint256 public constant SLIPPAGE_BPS = 200;       // 2% max slippage
 
@@ -166,10 +167,10 @@ contract DreamsTreasurySale is ReentrancyGuard {
     // ============ MAIN PURCHASE FUNCTIONS ============
 
     /**
-     * @notice Buy DREAMS with native token (ETH/AVAX) - treasury takes 10% fee
+     * @notice Buy DREAMS with native token (ETH/AVAX) - treasury takes 5% fee
      * @dev Route: ETH/AVAX → JUICY → DREAMS
-     *      Treasury receives 10% of DREAMS bought
-     *      User receives 90% of DREAMS bought (optionally auto-staked)
+     *      Treasury receives 5% of DREAMS bought
+     *      User receives 95% of DREAMS bought (optionally auto-staked)
      */
     function buyWithNative() external payable nonReentrant {
         if (!salesEnabled) revert SalesDisabled();
@@ -196,7 +197,7 @@ contract DreamsTreasurySale is ReentrancyGuard {
     }
 
     /**
-     * @notice Buy DREAMS directly with JUICY - treasury takes 10% fee
+     * @notice Buy DREAMS directly with JUICY - treasury takes 5% fee
      * @param juicyAmount Amount of JUICY to spend
      */
     function buyWithJuicy(uint256 juicyAmount) external nonReentrant {
@@ -229,16 +230,16 @@ contract DreamsTreasurySale is ReentrancyGuard {
      * @dev Shared logic for both buyWithNative and buyWithJuicy
      * @param recipient The user receiving DREAMS
      * @param totalDreams Total DREAMS received from swap
-     * @return treasuryFee Amount sent to treasury (10%)
-     * @return userAmount Amount sent to user (90%)
+     * @return treasuryFee Amount sent to treasury (5%)
+     * @return userAmount Amount sent to user (95%)
      */
     function _completePurchase(address recipient, uint256 totalDreams)
         internal
         returns (uint256 treasuryFee, uint256 userAmount)
     {
         // Calculate fee split
-        treasuryFee = (totalDreams * TREASURY_FEE_BPS) / BPS_DENOMINATOR;  // 10%
-        userAmount = totalDreams - treasuryFee;  // 90%
+        treasuryFee = (totalDreams * TREASURY_FEE_BPS) / BPS_DENOMINATOR;  // 5%
+        userAmount = totalDreams - treasuryFee;  // 95%
 
         // Send fee to treasury
         dreams.safeTransfer(treasury, treasuryFee);
@@ -368,8 +369,8 @@ contract DreamsTreasurySale is ReentrancyGuard {
      * @param nativeAmount Amount of ETH/AVAX to spend
      * @return juicyEstimate Estimated JUICY from first swap
      * @return dreamsEstimate Total DREAMS from second swap
-     * @return treasuryFee 10% fee to treasury
-     * @return userReceives 90% that user receives
+     * @return treasuryFee 5% fee to treasury
+     * @return userReceives 95% that user receives
      */
     function getQuoteNative(uint256 nativeAmount) external view returns (
         uint256 juicyEstimate,

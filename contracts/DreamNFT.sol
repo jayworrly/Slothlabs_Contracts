@@ -142,14 +142,14 @@ contract DreamNFT is ERC721, ERC721URIStorage, ERC721Enumerable, ERC2981, Ownabl
      * @notice Mint a new Dream NFT with IP protection
      * @param to Address to mint the NFT to (dream creator)
      * @param contentHash Keccak256 hash of dream content (title + content + category)
-     * @param tokenURI IPFS URI containing full metadata
+     * @param _tokenURI IPFS URI containing full metadata
      * @param metadata On-chain metadata struct
      * @return tokenId The newly minted token ID
      */
     function mintDream(
         address to,
         bytes32 contentHash,
-        string memory tokenURI,
+        string memory _tokenURI,
         DreamMetadata memory metadata
     ) external onlyAuthorizedMinter nonReentrant returns (uint256) {
         // Validate content hash
@@ -168,7 +168,7 @@ contract DreamNFT is ERC721, ERC721URIStorage, ERC721Enumerable, ERC2981, Ownabl
 
         // Mint the NFT
         _safeMint(to, newTokenId);
-        _setTokenURI(newTokenId, tokenURI);
+        _setTokenURI(newTokenId, _tokenURI);
 
         // Store metadata
         contentHashToTokenId[contentHash] = newTokenId;
@@ -180,7 +180,7 @@ contract DreamNFT is ERC721, ERC721URIStorage, ERC721Enumerable, ERC2981, Ownabl
             _enableIPProtection(newTokenId, metadata.ipTier, metadata.licenseType, contentHash, to);
         }
 
-        emit DreamMinted(newTokenId, to, contentHash, metadata.mongoId, tokenURI, metadata.ipTier, metadata.licenseType);
+        emit DreamMinted(newTokenId, to, contentHash, metadata.mongoId, _tokenURI, metadata.ipTier, metadata.licenseType);
 
         return newTokenId;
     }

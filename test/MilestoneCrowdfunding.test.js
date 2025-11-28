@@ -342,9 +342,9 @@ describe("MilestoneCrowdfunding", function () {
       const creatorBalanceAfter = await usdc.balanceOf(creator.address);
 
       // First milestone is 30% of 1000 = 300
-      // Fee split: 80% creator, 10% treasury, 5% JUICY stakers, 5% DREAMS stakers
-      // Creator gets: 300 * 80% = 240
-      const expectedRelease = ethers.parseEther("240");
+      // Fee split: 92.5% creator, 5% treasury, 1.25% JUICY stakers, 1.25% DREAMS stakers
+      // Creator gets: 300 * 92.5% = 277.5
+      const expectedRelease = ethers.parseEther("277.5");
       expect(creatorBalanceAfter - creatorBalanceBefore).to.equal(expectedRelease);
     });
   });
