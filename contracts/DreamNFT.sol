@@ -117,6 +117,12 @@ contract DreamNFT is ERC721, ERC721URIStorage, ERC721Enumerable, ERC2981, Ownabl
     event MinterAuthorized(address indexed minter);
     event MinterRevoked(address indexed minter);
     event DreamContentUpdated(uint256 indexed tokenId, string newTokenURI);
+    event MarketplaceTransfer(
+        address indexed from,
+        address indexed to,
+        uint256 indexed tokenId,
+        address operator
+    );
 
     // ===== ERRORS =====
     error DuplicateDream(uint256 existingTokenId);
@@ -240,6 +246,35 @@ contract DreamNFT is ERC721, ERC721URIStorage, ERC721Enumerable, ERC2981, Ownabl
         if (!_exists(tokenId)) revert TokenDoesNotExist();
         _setTokenURI(tokenId, newTokenURI);
         emit DreamContentUpdated(tokenId, newTokenURI);
+    }
+
+    // ===== MARKETPLACE FUNCTIONS =====
+
+    /**
+     * @notice Transfer a token as an authorized minter (for marketplace operations)
+     * @dev This allows the backend to facilitate marketplace sales without requiring
+     *      individual approvals from each seller. The authorized minter can transfer
+     *      tokens to complete purchases after verifying off-chain payment.
+     *
+     * SECURITY: This is a privileged operation. Only authorized minters (backend wallets)
+     * can call this. The backend must verify payment before calling this function.
+     *
+     * @param from Current token owner (seller)
+     * @param to New token owner (buyer)
+     * @param tokenId Token ID to transfer
+     */
+    function marketplaceTransfer(
+        address from,
+        address to,
+        uint256 tokenId
+    ) external onlyAuthorizedMinter nonReentrant {
+        if (!_exists(tokenId)) revert TokenDoesNotExist();
+        require(ownerOf(tokenId) == from, "DreamNFT: from is not the owner");
+        require(to != address(0), "DreamNFT: transfer to zero address");
+
+        _transfer(from, to, tokenId);
+
+        emit MarketplaceTransfer(from, to, tokenId, msg.sender);
     }
 
     // ===== VIEW FUNCTIONS =====
